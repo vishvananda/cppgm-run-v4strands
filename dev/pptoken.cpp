@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <cstdint>
 
 using namespace std;
 
@@ -129,33 +130,181 @@ const unordered_set<int> SimpleEscapeSequence_CodePoints =
 	'\'', '"', '?', '\\', 'a', 'b', 'f', 'n', 'r', 't', 'v'
 };
 
-// Tokenizer
-struct PPTokenizer
+// PA1 tokenizer. Translation and token emission are kept in one pass-oriented
+// component; later front-end phases consume the same IPPTokenStream contract.
+namespace {
+
+bool in_ranges(uint32_t c, const vector<pair<int,int> >& ranges)
 {
-	IPPTokenStream& output;
+    size_t lo=0, hi=ranges.size();
+    while(lo<hi) { size_t m=lo+(hi-lo)/2; if(c<static_cast<uint32_t>(ranges[m].first)) hi=m; else if(c>static_cast<uint32_t>(ranges[m].second)) lo=m+1; else return true; }
+    return false;
+}
+bool digit(uint32_t c) { return c>='0'&&c<='9'; }
+bool hex_digit(uint32_t c) { return digit(c)||(c>='a'&&c<='f')||(c>='A'&&c<='F'); }
+bool ident_start(uint32_t c) { return c=='_'||(c>='a'&&c<='z')||(c>='A'&&c<='Z')|| (in_ranges(c,AnnexE1_Allowed_RangesSorted)&&!in_ranges(c,AnnexE2_DisallowedInitially_RangesSorted)); }
+bool ident_cont(uint32_t c) { return ident_start(c)||digit(c)||in_ranges(c,AnnexE2_DisallowedInitially_RangesSorted); }
+void append_utf8(string& out, uint32_t c) {
+    if(c<=0x7f) out+=char(c);
+    else if(c<=0x7ff) {out+=char(0xc0|(c>>6));out+=char(0x80|(c&63));}
+    else if(c<=0xffff) {out+=char(0xe0|(c>>12));out+=char(0x80|((c>>6)&63));out+=char(0x80|(c&63));}
+    else {out+=char(0xf0|(c>>18));out+=char(0x80|((c>>12)&63));out+=char(0x80|((c>>6)&63));out+=char(0x80|(c&63));}
+}
+vector<uint32_t> decode_utf8(const string& s) {
+    vector<uint32_t> v;
+    for(size_t i=0;i<s.size();) {
+        unsigned char b=s[i++]; uint32_t c; unsigned n;
+        if(b<0x80){c=b;n=0;} else if(b>=0xc2&&b<=0xdf){c=b&31;n=1;} else if(b>=0xe0&&b<=0xef){c=b&15;n=2;} else if(b>=0xf0&&b<=0xf4){c=b&7;n=3;} else throw logic_error("invalid UTF-8 leading byte");
+        if(i+n>s.size()) throw logic_error("invalid UTF-8 continuation byte");
+        for(unsigned k=0;k<n;k++){unsigned char x=s[i++]; if((x&0xc0)!=0x80) throw logic_error("invalid UTF-8 continuation byte"); c=(c<<6)|(x&63);}
+        if((n==1&&c<0x80)||(n==2&&c<0x800)||(n==3&&c<0x10000)||c>0x10ffff||(c>=0xd800&&c<=0xdfff)) throw logic_error("invalid UTF-8 code point");
+        v.push_back(c);
+    }
+    return v;
+}
+string utf8(const vector<uint32_t>& v,size_t a,size_t b) { string s; for(size_t i=a;i<b;i++) append_utf8(s,v[i]); return s; }
+uint32_t tri(uint32_t c) {
+    switch(c){case '=':return '#';case '/':return '\\';case '\'':return '^';case '(':return '[';case ')':return ']';case '!':return '|';case '<':return '{';case '>':return '}';case '-':return '~';default:return 0;}
+}
+// Translate trigraphs/splices; preserve raw-string bodies, whose phase-1/2
+// transformations are reverted by the C++11 raw-string rule.
+vector<uint32_t> translate(const vector<uint32_t>& in) {
+    vector<uint32_t> a;
+    for(size_t i=0;i<in.size();) {
+        // Phase 1/2 transformations inside any C++11 raw-string spelling are
+        // reverted. Recognize every encoding prefix, not only the bare R form.
+        size_t quote=i;
+        if(i+3<in.size()&&in[i]=='u'&&in[i+1]=='8'&&in[i+2]=='R'&&in[i+3]=='"') quote=i+3;
+        else if(i+2<in.size()&&(in[i]=='u'||in[i]=='U'||in[i]=='L')&&in[i+1]=='R'&&in[i+2]=='"') quote=i+2;
+        else if(i+1<in.size()&&in[i]=='R'&&in[i+1]=='"') quote=i+1;
+        if(quote!=i) {
+            size_t op=quote+1; while(op<in.size()&&in[op]!='('&&in[op]!='\n'&&op-quote<=17) op++;
+            if(op<in.size()&&in[op]=='('&&op-quote-1<=16) {
+                string delim=utf8(in,quote+1,op); string close=")"+delim+"\""; size_t e=op+1;
+                for(;e+close.size()<=in.size();e++) if(utf8(in,e,e+close.size())==close) {e+=close.size();break;}
+                if(e<=in.size()&&e>op+1&&utf8(in,e-close.size(),e)==close) {a.insert(a.end(),in.begin()+i,in.begin()+e);i=e;continue;}
+            }
+        }
+        if(i+2<in.size()&&in[i]=='?'&&in[i+1]=='?'&&tri(in[i+2])) {a.push_back(tri(in[i+2]));i+=3;}
+        else a.push_back(in[i++]);
+    }
+    vector<uint32_t> b;
+    for(size_t i=0;i<a.size();i++) { if(a[i]=='\\'&&i+1<a.size()&&a[i+1]=='\n'){i++;continue;} b.push_back(a[i]); }
+    return b;
+}
 
-	PPTokenizer(IPPTokenStream& output)
-		: output(output)
-	{}
-
-	void process(int c)
-	{
-		// TODO:  Your code goes here.
-
-		// 1. do translation features
-		// 2. tokenize resulting stream
-		// 3. call an output.emit_* function for each token.
-
-		if (c == EndOfFile)
-		{
-			throw NotImplementedException();
-		}
-
-		// TIP: Reference implementation is about 1000 lines of code.
-		// It is a state machine with about 50 states, most of which
-		// are simple transitions of the operators.
-	}
+struct Scanner {
+    IPPTokenStream& out; vector<uint32_t> s; size_t i; bool bol; bool directive; bool directive_name_pending; bool include_next; bool emitted_any; bool line_had;
+    Scanner(IPPTokenStream& o,const vector<uint32_t>& x):out(o),s(x),i(0),bol(true),directive(false),directive_name_pending(false),include_next(false),emitted_any(false),line_had(false){}
+    void token(void(IPPTokenStream::*fn)(const string&),size_t a,size_t b) { (out.*fn)(utf8(s,a,b)); emitted_any=true; line_had=true; }
+    bool starts(size_t p,const string& x) { vector<uint32_t> q=decode_utf8(x); if(p+q.size()>s.size())return false; for(size_t k=0;k<q.size();k++)if(s[p+k]!=q[k])return false;return true; }
+    size_t ucn(size_t p, uint32_t& c) {
+        if (p + 2 > s.size() || s[p] != '\\' ||
+            (s[p + 1] != 'u' && s[p + 1] != 'U')) return p;
+        const size_t digits = s[p + 1] == 'u' ? 4 : 8;
+        const size_t first = p + 2;
+        if (first + digits > s.size()) return p;
+        uint32_t value = 0;
+        for (size_t k = 0; k < digits; ++k) {
+            if (!hex_digit(s[first + k])) return p;
+            value = (value << 4) | HexCharToValue(s[first + k]);
+        }
+        if (value > 0x10ffff || (value >= 0xd800 && value <= 0xdfff) ||
+            (value < 0xa0 && value != '$' && value != '@' && value != '`'))
+            throw logic_error("invalid universal character value");
+        c = value;
+        return first + digits;
+    }
+    string literal_spelling(size_t begin, size_t quote, size_t close, size_t end) {
+        string result = utf8(s, begin, quote + 1);
+        size_t p = quote + 1;
+        while (p < close) {
+            uint32_t value;
+            size_t next = ucn(p, value);
+            if (next != p && next <= close) {
+                append_utf8(result, value);
+                p = next;
+            } else if (s[p] == '\\' && p + 1 < close) {
+                result += utf8(s, p, p + 2);
+                p += 2;
+            } else {
+                result += utf8(s, p, p + 1);
+                ++p;
+            }
+        }
+        result += utf8(s, close, close + 1);
+        p = close + 1;
+        while (p < end) {
+            uint32_t value;
+            size_t next = ucn(p, value);
+            if (next != p) {
+                append_utf8(result, value);
+                p = next;
+            } else {
+                result += utf8(s, p, p + 1);
+                ++p;
+            }
+        }
+        return result;
+    }
+    void scan() {
+        // A nonempty source lacking LF receives the phase-2 terminating newline.
+        if(!s.empty()&&s.back()!='\n') s.push_back('\n');
+        if(s.size()>=3&&s[0]==0xfeff){s[0]=' ';}
+        static const char* ops[]={"%:%:","<<=",">>=","->*","...","##","<:",":>","<%","%>","%:","::",".*","->","++","--","<<",">>","<=",">=","==","!=","&&","||","+=","-=","*=","/=","%=","^=","&=","|=","new","delete","and_eq","not_eq","or_eq","xor_eq","bitand","bitor","compl","and","not","or","xor","or_eq",0};
+        while(i<s.size()) {
+            if(s[i]=='\n'){out.emit_new_line();i++;bol=true;directive=false;directive_name_pending=false;include_next=false;line_had=false;emitted_any=true;continue;}
+            if(s[i]==' '||s[i]=='\t'||s[i]=='\v'||s[i]=='\f'||s[i]=='\r'||(s[i]=='/'&&i+1<s.size()&&(s[i+1]=='/'||s[i+1]=='*'))){
+                bool had=false;
+                for(;;){while(i<s.size()&&s[i]!='\n'&&(s[i]==' '||s[i]=='\t'||s[i]=='\v'||s[i]=='\f'||s[i]=='\r')){i++;had=true;}
+                    if(i+1<s.size()&&s[i]=='/'&&s[i+1]=='/') {had=true;i+=2;while(i<s.size()&&s[i]!='\n')i++;break;}
+                    if(i+1<s.size()&&s[i]=='/'&&s[i+1]=='*'){had=true;i+=2;bool closed=false;while(i<s.size()){if(s[i]=='\n'){i++;continue;}if(s[i]=='*'&&i+1<s.size()&&s[i+1]=='/'){i+=2;closed=true;break;}i++;}if(!closed)throw logic_error("unterminated block comment");continue;}break;
+                }
+                if(had)out.emit_whitespace_sequence(); continue;
+            }
+            size_t a=i;
+            // Header-name is enabled only after #include at logical line start.
+            if(include_next&&(s[i]=='<'||s[i]=='"')) {uint32_t q=s[i]=='<'?'>':'"';size_t j=i+1;while(j<s.size()&&s[j]!='\n'&&s[j]!=q)j++;if(j<s.size()&&s[j]==q){i=j+1;token(&IPPTokenStream::emit_header_name,a,i);include_next=false;bol=false;continue;}}
+            // String/character literals, with standard encoding prefixes.
+            size_t quote=i; bool raw=false; string rawprefix;
+            if(starts(i,"u8R\"")||starts(i,"uR\"")||starts(i,"UR\"")||starts(i,"LR\"")||starts(i,"R\"")){raw=true;quote=i+(starts(i,"u8R\"")?3:starts(i,"R\"")?1:2);}
+            else if(starts(i,"u8\""))quote=i+2;
+            else if((s[i]=='u'||s[i]=='U'||s[i]=='L')&&i+1<s.size()&&(s[i+1]=='\''||s[i+1]=='\"'))quote=i+1;
+            if(raw){size_t op=quote+1;while(op<s.size()&&s[op]!='('&&s[op]!='\n'){if(s[op]==' '||s[op]=='\\'||s[op]==')'||s[op]=='\t'||s[op]=='\v'||s[op]=='\f'||op-quote>16)throw logic_error("raw string delimiter is too long");op++;}if(op>=s.size()||s[op]!='(')throw logic_error("unterminated raw string literal");string d=utf8(s,quote+1,op), close=")"+d+"\"";size_t j=op+1;while(j+close.size()<=s.size()&&utf8(s,j,j+close.size())!=close)j++;if(j+close.size()>s.size())throw logic_error("unterminated raw string literal");i=j+close.size();size_t after=i;while(i<s.size()&&ident_cont(s[i]))i++;token(i>after?&IPPTokenStream::emit_user_defined_string_literal:&IPPTokenStream::emit_string_literal,a,i);bol=false;continue;}
+            if(s[quote]=='\''||s[quote]=='\"'){
+                uint32_t q=s[quote]; bool ch=q=='\'';size_t j=quote+1;bool closed=false;
+                while(j<s.size()&&s[j]!='\n'){if(s[j]==q){j++;closed=true;break;}if(s[j]=='\\'){if(j+1>=s.size()||s[j+1]=='\n')break;uint32_t e=s[j+1];if(SimpleEscapeSequence_CodePoints.count(e)){j+=2;continue;}if(e>='0'&&e<='7'){size_t k=j+1;while(k<s.size()&&k<j+4&&s[k]>='0'&&s[k]<='7')k++;j=k;continue;}if(e=='x'){size_t k=j+2;while(k<s.size()&&hex_digit(s[k]))k++;if(k==j+2)throw logic_error("hex escape has no digits");j=k;continue;}uint32_t escaped;size_t un=ucn(j,escaped);if(un!=j){j=un;continue;}throw logic_error("invalid escape sequence");}uint32_t cv;size_t uj=ucn(j,cv);j=uj==j?j+1:uj;}
+                if(!closed)throw logic_error("unterminated quoted literal");
+                i=j;
+                size_t after=i;
+                while(i<s.size()){
+                    uint32_t cv; size_t uj=ucn(i,cv);
+                    if(uj!=i){i=uj;continue;}
+                    if(!ident_cont(s[i]))break;
+                    i++;
+                }
+                bool ud=i>after;
+                string spelling=literal_spelling(a,quote,j-1,i);
+                if(ch){ if(ud)out.emit_user_defined_character_literal(spelling);else out.emit_character_literal(spelling); }
+                else { if(ud)out.emit_user_defined_string_literal(spelling);else out.emit_string_literal(spelling); }
+                line_had=true;
+                emitted_any=true;
+                bol=false;
+                continue;bol=false;continue;
+            }
+            // Identifier (UCNs are decoded for identifier spelling).
+            {uint32_t c=s[i];size_t uj=ucn(i,c);if(uj!=i&&!ident_start(c)){string spelling;append_utf8(spelling,c);i=uj;out.emit_non_whitespace_char(spelling);bol=false;continue;}if(uj!=i||ident_start(c)){string spelling;size_t j=i;bool first=true;while(j<s.size()){uint32_t x=s[j];size_t n=ucn(j,x);if(n==j&&! (first?ident_start(x):ident_cont(x)))break;if(n!=j&&!(first?ident_start(x):ident_cont(x)))break;if(n==j){append_utf8(spelling,x);j++;}else{append_utf8(spelling,x);j=n;}first=false;}if(j>i){i=j;if(Digraph_IdentifierLike_Operators.count(spelling))out.emit_preprocessing_op_or_punc(spelling);else out.emit_identifier(spelling);line_had=true;if(directive_name_pending){include_next=(spelling=="include");directive_name_pending=false;}bol=false;continue;}}
+            }
+            if(digit(s[i])||(s[i]=='.'&&i+1<s.size()&&digit(s[i+1]))){size_t j=i+1;while(j<s.size()){if(digit(s[j])||ident_cont(s[j])||s[j]=='.'){j++;continue;}if((s[j]=='+'||s[j]=='-')&&j>i&&(s[j-1]=='e'||s[j-1]=='E')){j++;continue;}break;}i=j;token(&IPPTokenStream::emit_pp_number,a,i);bol=false;continue;}
+            bool matched=false;for(int k=0;ops[k];k++){string op=ops[k];if(op=="<:"&&starts(i,"<::")&&(i+3>=s.size()||(s[i+3]!=':'&&s[i+3]!='>')))continue;if(starts(i,op)){i+=op.size();if(op=="<:"&&i<s.size()&&s[i]==':'){}token(&IPPTokenStream::emit_preprocessing_op_or_punc,a,i);if(bol&&(op=="#"||op=="%:")){directive=true;directive_name_pending=true;}bol=false;matched=true;break;}}if(matched)continue;
+            if(string("{}[]#();:?~!%^&|=<>+-*/.,").find(char(s[i]))!=string::npos){i++;token(&IPPTokenStream::emit_preprocessing_op_or_punc,a,i);if(bol&&s[a]=='#'){directive=true;directive_name_pending=true;}bol=false;continue;}
+            if(s[i]=='\''||s[i]=='"')throw logic_error("unterminated literal");i++;token(&IPPTokenStream::emit_non_whitespace_char,a,i);bol=false;
+        }
+        out.emit_eof();
+    }
 };
+
+} // namespace
 
 bool HasBatchStdinArg(int argc, char** argv)
 {
@@ -167,15 +316,18 @@ bool HasBatchStdinArg(int argc, char** argv)
 	return false;
 }
 
-int RunNotImplementedBatchMode()
+int RunBatchMode()
 {
-	string line;
-	while (getline(cin, line))
-	{
-		(void)line;
-		cout << "EXIT_NOT_IMPLEMENTED" << endl;
-	}
-	return EXIT_SUCCESS;
+    string record;
+    while (getline(cin, record)) {
+        if(record.empty()) continue;
+        vector<string> fields; size_t at=0; for(;;){size_t t=record.find('\t',at);fields.push_back(record.substr(at,t==string::npos?t:t-at));if(t==string::npos)break;at=t+1;}
+        if(fields.size()!=3){cout<<"EXIT_FAILURE\n";continue;}
+        ifstream in(fields[2].c_str(),ios::binary); if(!in){ofstream e(fields[1].c_str());e<<"ERROR: cannot read input\n";cout<<"EXIT_FAILURE\n";continue;}
+        ostringstream data;data<<in.rdbuf(); ofstream outFile(fields[0].c_str(),ios::binary); streambuf* oldOut=cout.rdbuf(outFile.rdbuf());streambuf* oldErr=cerr.rdbuf(outFile.rdbuf()); int status=0;
+        try{DebugPPTokenStream sink;vector<uint32_t> cps=decode_utf8(data.str());vector<uint32_t> translated=translate(cps);Scanner sc(sink,translated);sc.scan();}catch(exception& e){cerr<<"ERROR: "<<e.what()<<endl;status=1;}
+        cout.rdbuf(oldOut);cerr.rdbuf(oldErr);cout<<(status?"EXIT_FAILURE":"EXIT_SUCCESS")<<endl;
+    }return 0;
 }
 
 int main(int argc, char** argv)
@@ -183,7 +335,7 @@ int main(int argc, char** argv)
 	try
 	{
 		if (HasBatchStdinArg(argc, argv))
-			return RunNotImplementedBatchMode();
+			return RunBatchMode();
 
 		ostringstream oss;
 		oss << cin.rdbuf();
@@ -191,16 +343,10 @@ int main(int argc, char** argv)
 		string input = oss.str();
 
 		DebugPPTokenStream output;
-
-		PPTokenizer tokenizer(output);
-
-		for (char c : input)
-		{
-			unsigned char code_unit = c;
-			tokenizer.process(code_unit);
-		}
-
-		tokenizer.process(EndOfFile);
+        vector<uint32_t> cps=decode_utf8(input);
+        vector<uint32_t> translated=translate(cps);
+        Scanner scanner(output,translated);
+        scanner.scan();
 
 		return EXIT_SUCCESS;
 	}
