@@ -1,19 +1,25 @@
-# PA3 implementation plan
+# PA3 final plan and audit ledger
 
-## Alignment and review markers
-- Current-stage scope: PA3 ppexpr; retain PA1 phase-1–3 tokenization and PA2 cumulative tools. Keep the PA3 CLI separate from production compiler transport; expressions are parsed/evaluated directly, not via rendered token text.
-- Stage base commit: `a2af5efaf69c05acf888546f278721110c47d32b`
-- Last reviewed commit: `1ff7afd8c8a246eb93cc655000376f965d12e5b1`
-- Start state: 0/20 stage tests; all report EXIT_NOT_IMPLEMENTED. The provider's progress log had no usable turn-start baseline (failure count unknown); required fixture set and comparisons remain unchanged.
+- **Target / disposition:** `pa3 full-stage`, audit complete for PA3's standalone `ppexpr` surface. See [audit.md](audit.md) for independent data-flow reconstruction, language/architecture review, findings and frozen measurement detail.
+- **Reviewed history:** base `a2af5efaf69c05acf888546f278721110c47d32`; implementation `1ff7afd8c8a246eb93cc655000376f965d12e5b1`; review marker `013530228`. Initial stage tests were 0/20 (not implemented); no test, reference, coverage or comparison rules were changed.
 
-## Behavior groups / ledger
-1. **Input, preprocessing lines, and output** — owner: `dev/ppexpr.cpp`; flow: stdin → PA1 scan/phase-3 logical lines → per-line expression parser → result/error and final eof. Boundaries include comments, splices, blank lines, fatal phase errors, batch harness mode. Linear in input/tokens; validate all PA3 tests and explicit student tests.
-2. **Expression grammar, integer/character literals, `defined`** — owner: new PA3 expression evaluator under `dev/src/`; flow: PA1 preprocessing-token stream → typed integer values → output. Pratt/precedence parser, checked literal decoding and mock-defined identifier. Linear parsing apart from integer conversions; validates primary/grammar/defined/unicode fixtures. Character cardinality/range follows PA2's explicit contract; integer candidates follow C++11 [lex.icon].
-3. **Integral semantics and lazy evaluation** — owner: same evaluator; values are 64-bit signed/unsigned course integers; usual conversions, short-circuit and selected-branch evaluation retain static conditional result type. Constant work per operator. Unsigned storage implements fixed-width bit patterns; signed right shift explicitly sign-extends for the handout's defined behavior. Validate operator/order/type/overflow fixtures and boundary tests.
+## Final design / behavior ledger
 
-## Performance / remaining work
-- No inherited PA3 executable or performance baselines at entry. No optimization claim/change: correctness evaluator is linear in token count (each token parsed a bounded number of times), aside from literal conversion.
-- Performance evidence (GNU g++ `-std=gnu++11 -Wall -O3`, Linux x86-64): forced full ppexpr rebuild `make -B -C dev ppexpr` measured 3.19 s / 145,608 KiB peak RSS. The 492,075-line PA3 triple input ran in 3.39–3.42 s across three single runs (194,180–194,216 KiB peak RSS); all 492,076 output lines matched the course reference. Final executable `.text` is 112,743 bytes (`size dev/ppexpr`). These are measurements, not an optimization A/B claim or benefit; PA3 emits no generated program, so generated-program runtime/text acceptance is inapplicable. Spec §9 supplies no numeric ppexpr budget, so none is invented.
-- Handoff ledger: PA3 expression/CLI groups 1–3 complete; 20/20 PA3 fixtures, 103/103 through PA3, and focused `student.tests/pa3-basic.in` comparison pass. No known required-fixture defect remains.
-- Known unfinished cross-stage architecture item (not an audit waiver): shared `ScanPreprocessingTokens(const string&, ...)` materializes decoded/translated character vectors before callbacks, so it does not yet meet the production spec's streaming-cursor/memory goals. Owner/dataflow: PA1 shared tokenizer (`source → decoded code points → phase-1/2 view → callback tokens`); complexity is linear but memory is O(source code points) in multiple representations. A ppexpr-local replacement would duplicate phase 1–3 and violate shared-phase design; fix requires an independently validated shared scanner/input-cursor refactor and PA1–PA3 regression runs, so it is outside this coherent PA3 evaluator group. The measured ~194 MiB peak on triple fixture documents the concern.
-- Independent audit questions, not waived: review PA3 integer candidate typing, character-literal decoding, and compatibility of the shared scan API with staged frontend architecture. Inherited audit warning: tokenizer nesting depth 7, unchanged. Stage base and Last reviewed markers remain at the recorded entry commit.
+1. `dev/ppexpr.cpp`: stdin or batch-file bytes → one owned source string → shared phase-1–3 scanner → PA3 token callbacks/current logical-line vector → result/error output and final `eof`. Phase failures remain process-fatal; expression errors are line-local.
+2. `dev/src/preprocess/pp_tokenizer.cpp`: inherited UTF-8 decode, phase-1/2 translation and source-offset/raw-literal restoration, phase-3 tokenization and synchronous callbacks. Linear in source/tokens; multiple source-sized code-point views remain a known architecture handoff.
+3. `dev/src/pa3_expression.cpp`: current-line token vector → precedence parser and checked integer/character decoding → signed/unsigned course-value semantics, lazy logical/conditional evaluation with static conditional common type → decimal result. No optimization/IR pass exists in PA3.
+
+Course integer and character semantics were reviewed against C++11 N3337 [lex.icon], [lex.ccon] plus PA3's explicit promotion, scalar, and evaluation rules. No unsupported reference defect was proved, so references remain untouched. Required behavior groups 1–3 are closed; no reference corrections or coverage edits were made.
+
+## Audit fix and performance disposition
+
+- Replaced `ostringstream` staging plus `.str()` source copies in ordinary and batch CLI input with one string filled by a 64 KiB buffered read loop, kept alive through the synchronous scanner call. Exact behavior is unchanged.
+- Final frozen serial A/A calibration plus four balanced ABBA A/C blocks are under `$RALPH_ARTIFACT_DIR/pa3-final-audit/`. On a fixed 9,675,000-byte, 600,000-expression workload all output hashes matched. Candidate peak RSS consistently decreased about 9.3 MiB (A roughly 180.3 MiB; C roughly 171.0 MiB); `.text` fell from 112,743 to 110,888 bytes. Wall time was too noisy to claim any repeatable benefit. One forced C build was 8.22 s / 146,108 KiB; descriptive only. This is source-ownership cleanup, not optimizer or generated-code claim.
+- No numeric performance pass/fail limits exist in PA1–PA3 specs/plans. PA1's inherited A/B evidence demonstrates ~63.5% lower tokenizer runtime, while disclosing +5.9% RSS, +13% `.text`, and slower object build; without a numeric budget this remains a stage-scoped measured benefit with tradeoffs, not an unsupported rejection gate. PA2's measurements are descriptive, not an A/B claim. No invented latency/RSS/runtime/text/IR gate is retained. PA3 produces no generated programs, so executable runtime/text acceptance is inapplicable. There is no whole-compiler benchmark suite on these stages; front-to-ELF benchmarks remain an explicit handoff.
+
+## Final validation / remaining handoffs
+
+- `perl scripts/cppgm_file_audit.pl --stage pa3 --paths dev/src`: pass; one inherited complexity advisory at `dev/src/preprocess/pp_tokenizer.cpp:825` (nesting depth 7).
+- `make test-report-through-pa3`: pass, 103/103 (PA1 57/57, PA2 26/26, PA3 20/20); all tracked stages pass. Primary log: `/home/vishvananda/work/.ralph/v4strands-gpt-6-luna-max/last-test.log`.
+- Remaining unaudited handoffs since PA2: convert shared phase-1–3 scanning from full-input/vector views to source-backed streaming token cursor; later parser/semantic graph, template demand/caches, direct typed LowIR, bounded optimization, native backend and ELF generation, including the spec's nontrivial declaration/template-to-ELF and optimization-runtime audit. PA3 does not claim these absent surfaces are complete.
+- Final commit and clean-tree status are recorded after commit in the repository history/state.

@@ -3,7 +3,6 @@
 #include <exception>
 #include <fstream>
 #include <iostream>
-#include <sstream>
 #include <string>
 #include <vector>
 
@@ -60,6 +59,16 @@ struct ExpressionLines : IPPTokenStream {
   void emit_eof() { evaluate_line(); }
 };
 
+std::string read_source(std::istream &input) {
+  std::string source;
+  char buffer[64 * 1024];
+  while (input) {
+    input.read(buffer, sizeof(buffer));
+    source.append(buffer, static_cast<std::size_t>(input.gcount()));
+  }
+  return source;
+}
+
 bool has_batch_stdin_arg(int argc, char **argv) {
   for (int i = 1; i < argc; ++i)
     if (std::string(argv[i]) == "--batch-stdin")
@@ -91,13 +100,12 @@ int run_batch_stdin() {
       std::cout << "EXIT_FAILURE\n";
       continue;
     }
-    std::ostringstream source;
-    source << input.rdbuf();
+    const std::string source = read_source(input);
     std::streambuf *old = std::cout.rdbuf(output.rdbuf());
     int status = EXIT_SUCCESS;
     try {
       ExpressionLines lines;
-      ScanPreprocessingTokens(source.str(), lines);
+      ScanPreprocessingTokens(source, lines);
       std::cout << "eof\n";
     } catch (const std::exception &e) {
       std::ofstream err(errpath.c_str());
@@ -115,11 +123,10 @@ int run_batch_stdin() {
 int main(int argc, char **argv) {
   if (has_batch_stdin_arg(argc, argv))
     return run_batch_stdin();
-  std::ostringstream source;
-  source << std::cin.rdbuf();
+  const std::string source = read_source(std::cin);
   try {
     ExpressionLines lines;
-    ScanPreprocessingTokens(source.str(), lines);
+    ScanPreprocessingTokens(source, lines);
     std::cout << "eof\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &e) {
