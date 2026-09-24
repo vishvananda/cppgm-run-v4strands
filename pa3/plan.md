@@ -3,7 +3,7 @@
 ## Alignment and review markers
 - Current-stage scope: PA3 ppexpr; retain PA1 phase-1–3 tokenization and PA2 cumulative tools. Keep the PA3 CLI separate from production compiler transport; expressions are parsed/evaluated directly, not via rendered token text.
 - Stage base commit: `a2af5efaf69c05acf888546f278721110c47d32b`
-- Last reviewed commit: `a2af5efaf69c05acf888546f278721110c47d32b`
+- Last reviewed commit: `1ff7afd8c8a246eb93cc655000376f965d12e5b1`
 - Start state: 0/20 stage tests; all report EXIT_NOT_IMPLEMENTED. The provider's progress log had no usable turn-start baseline (failure count unknown); required fixture set and comparisons remain unchanged.
 
 ## Behavior groups / ledger
