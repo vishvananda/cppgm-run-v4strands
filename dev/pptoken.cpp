@@ -7,6 +7,8 @@
 #include <unordered_set>
 #include <vector>
 #include <cstdint>
+#include <limits>
+#include <utility>
 
 using namespace std;
 
@@ -166,38 +168,282 @@ string utf8(const vector<uint32_t>& v,size_t a,size_t b) { string s; for(size_t 
 uint32_t tri(uint32_t c) {
     switch(c){case '=':return '#';case '/':return '\\';case '\'':return '^';case '(':return '[';case ')':return ']';case '!':return '|';case '<':return '{';case '>':return '}';case '-':return '~';default:return 0;}
 }
-// Translate trigraphs/splices; preserve raw-string bodies, whose phase-1/2
-// transformations are reverted by the C++11 raw-string rule.
-vector<uint32_t> translate(const vector<uint32_t>& in) {
-    vector<uint32_t> a;
-    for(size_t i=0;i<in.size();) {
-        // Phase 1/2 transformations inside any C++11 raw-string spelling are
-        // reverted. Recognize every encoding prefix, not only the bare R form.
+struct Phase12View {
+    vector<uint32_t> chars;
+    vector<uint32_t> compact_source_offsets;
+    vector<size_t> wide_source_offsets;
+    bool wide_offsets;
+
+    explicit Phase12View(bool wide=false):wide_offsets(wide){}
+    void push(uint32_t c,size_t source_offset) {
+        chars.push_back(c);
+        if(wide_offsets) wide_source_offsets.push_back(source_offset);
+        else compact_source_offsets.push_back(static_cast<uint32_t>(source_offset));
+    }
+    size_t source_offset(size_t i) const {
+        return wide_offsets?wide_source_offsets[i]:compact_source_offsets[i];
+    }
+    void release_offsets() {
+        vector<uint32_t>().swap(compact_source_offsets);
+        vector<size_t>().swap(wide_source_offsets);
+    }
+};
+
+Phase12View make_phase12_view(const vector<uint32_t>& source) {
+    Phase12View view(source.size()>numeric_limits<uint32_t>::max());
+    // Fuse phase-1 trigraph replacement with phase-2 splicing. The source
+    // buffer stays immutable; offsets retain the physical origin for raw-text
+    // restoration, without materializing separate phase-1 character/offset
+    // arrays.
+    for(size_t i=0;i<source.size();) {
+        size_t origin=i;
+        uint32_t c;
+        if(i+2<source.size()&&source[i]=='?'&&source[i+1]=='?'&&tri(source[i+2])) {
+            c=tri(source[i+2]); i+=3;
+        } else {
+            c=source[i++];
+        }
+        if(c=='\\'&&i<source.size()&&source[i]=='\n') { ++i; continue; }
+        view.push(c,origin);
+    }
+    return view;
+}
+
+bool raw_prefix_at(const vector<uint32_t>& s, size_t i, size_t& quote) {
+    if(i+3<s.size()&&s[i]=='u'&&s[i+1]=='8'&&s[i+2]=='R'&&s[i+3]=='"') quote=i+3;
+    else if(i+2<s.size()&&(s[i]=='u'||s[i]=='U'||s[i]=='L')&&s[i+1]=='R'&&s[i+2]=='"') quote=i+2;
+    else if(i+1<s.size()&&s[i]=='R'&&s[i+1]=='"') quote=i+1;
+    else return false;
+    return true;
+}
+
+size_t raw_literal_end_after_quote(const vector<uint32_t>& s, size_t quote) {
+    size_t open=quote+1;
+    while(open<s.size()&&s[open]!='('&&s[open]!='\n'&&open-quote<=17) {
+        if(s[open]==' '||s[open]=='\\'||s[open]==')'||s[open]=='\t'||s[open]=='\v'||s[open]=='\f') return quote;
+        ++open;
+    }
+    if(open>=s.size()||s[open]!='('||open-quote-1>16) return quote;
+    string close=")"+utf8(s,quote+1,open)+"\"";
+    for(size_t p=open+1;p+close.size()<=s.size();++p) {
+        size_t k=0;
+        while(k<close.size()&&s[p+k]==static_cast<unsigned char>(close[k])) ++k;
+        if(k==close.size()) return p+close.size();
+    }
+    // A valid raw opener with no close is one partial token through EOF.
+    return s.size();
+}
+
+bool scan_ucn(const vector<uint32_t>& s, size_t p, uint32_t& value, size_t& end) {
+    if(p+2>s.size()||s[p]!='\\'||(s[p+1]!='u'&&s[p+1]!='U')) return false;
+    size_t digits=s[p+1]=='u'?4:8;
+    if(p+2+digits>s.size()) return false;
+    value=0;
+    for(size_t k=0;k<digits;++k) {
+        if(!hex_digit(s[p+2+k])) return false;
+        value=(value<<4)|HexCharToValue(s[p+2+k]);
+    }
+    end=p+2+digits;
+    return true;
+}
+
+struct RawLiteralRange {
+    size_t prefix_end;
+    size_t translated_end;
+    size_t source_quote;
+    size_t source_end;
+};
+
+// Identify raw literals in the phase-1/2 view so comment and token boundaries
+// are correct. This lexical walk skips comments, ordinary literals,
+// identifiers, and pp-numbers: an R" sequence inside one of those
+// preprocessing tokens is not a raw-string introducer.
+vector<RawLiteralRange> raw_literal_ranges(const Phase12View& view,
+                                           const vector<uint32_t>& source) {
+    const vector<uint32_t>& s=view.chars;
+    vector<RawLiteralRange> ranges;
+    size_t i=0;
+    bool beginning_of_line=true;
+    bool directive_name_pending=false;
+    bool include_header_pending=false;
+    while(i<s.size()) {
+        uint32_t c=s[i];
+        if(c=='\n') {
+            ++i; beginning_of_line=true;
+            directive_name_pending=false; include_header_pending=false;
+            continue;
+        }
+        if(c==' '||c=='\t'||c=='\v'||c=='\f'||c=='\r') { ++i; continue; }
+        if(i+1<s.size()&&s[i]=='/'&&s[i+1]=='/') {
+            i+=2; while(i<s.size()&&s[i]!='\n') ++i; continue;
+        }
+        if(i+1<s.size()&&s[i]=='/'&&s[i+1]=='*') {
+            i+=2;
+            while(i+1<s.size()&&!(s[i]=='*'&&s[i+1]=='/')) {
+                if(s[i]=='\n') { beginning_of_line=true; directive_name_pending=false; include_header_pending=false; }
+                ++i;
+            }
+            i=i+1<s.size()?i+2:s.size(); continue;
+        }
+        // Header names are context-dependent preprocessing tokens. An R\" or
+        // trigraph-looking sequence inside an #include header is not a raw
+        // string and must remain subject to phase-1/2 translation.
+        if(include_header_pending&&(c=='<'||c=='"')) {
+            uint32_t close=c=='<'?'>':'"'; ++i;
+            while(i<s.size()&&s[i]!='\n'&&s[i]!=close) ++i;
+            if(i<s.size()&&s[i]==close) ++i;
+            include_header_pending=false; directive_name_pending=false;
+            beginning_of_line=false; continue;
+        }
+        if(include_header_pending) include_header_pending=false;
+        // Recognize the directive introducer only at the start of a logical
+        // line. The alternative # spelling is %:, while %:%: is ##.
+        bool directive_hash=beginning_of_line&&
+            (c=='#'||(i+1<s.size()&&c=='%'&&s[i+1]==':'))&&
+            !(i+3<s.size()&&c=='%'&&s[i+1]==':'&&s[i+2]=='%'&&s[i+3]==':');
+        if(directive_hash) {
+            i+=(c=='#'?1:2);
+            directive_name_pending=true;
+            include_header_pending=false;
+            beginning_of_line=false;
+            continue;
+        }
         size_t quote=i;
-        if(i+3<in.size()&&in[i]=='u'&&in[i+1]=='8'&&in[i+2]=='R'&&in[i+3]=='"') quote=i+3;
-        else if(i+2<in.size()&&(in[i]=='u'||in[i]=='U'||in[i]=='L')&&in[i+1]=='R'&&in[i+2]=='"') quote=i+2;
-        else if(i+1<in.size()&&in[i]=='R'&&in[i+1]=='"') quote=i+1;
-        if(quote!=i) {
-            size_t op=quote+1; while(op<in.size()&&in[op]!='('&&in[op]!='\n'&&op-quote<=17) op++;
-            if(op<in.size()&&in[op]=='('&&op-quote-1<=16) {
-                string delim=utf8(in,quote+1,op); string close=")"+delim+"\""; size_t e=op+1;
-                for(;e+close.size()<=in.size();e++) if(utf8(in,e,e+close.size())==close) {e+=close.size();break;}
-                if(e<=in.size()&&e>op+1&&utf8(in,e-close.size(),e)==close) {a.insert(a.end(),in.begin()+i,in.begin()+e);i=e;continue;}
+        if(raw_prefix_at(s,i,quote)) {
+            size_t source_quote=view.source_offset(quote);
+            size_t source_end=raw_literal_end_after_quote(source,source_quote);
+            if(source_end!=source_quote) {
+                size_t translated_end=quote+1;
+                while(translated_end<view.chars.size()&&
+                      view.source_offset(translated_end)<source_end) ++translated_end;
+                RawLiteralRange range={quote+1,translated_end,
+                                       source_quote,source_end};
+                ranges.push_back(range);
+                i=translated_end;
+                beginning_of_line=false;
+                directive_name_pending=false;
+                continue;
             }
         }
-        if(i+2<in.size()&&in[i]=='?'&&in[i+1]=='?'&&tri(in[i+2])) {a.push_back(tri(in[i+2]));i+=3;}
-        else a.push_back(in[i++]);
+        // Skip ordinary string/character literals, including their encoding
+        // prefixes, before looking for any later raw-string token.
+        size_t ordinary_quote=i;
+        if(i+2<s.size()&&s[i]=='u'&&s[i+1]=='8'&&s[i+2]=='"') ordinary_quote=i+2;
+        else if(i+1<s.size()&&(s[i]=='u'||s[i]=='U'||s[i]=='L')&&(s[i+1]=='"'||s[i+1]=='\'')) ordinary_quote=i+1;
+        if(s[ordinary_quote]=='"'||s[ordinary_quote]=='\'') {
+            uint32_t delimiter=s[ordinary_quote++];
+            while(ordinary_quote<s.size()&&s[ordinary_quote]!='\n') {
+                if(s[ordinary_quote]=='\\'&&ordinary_quote+1<s.size()) ordinary_quote+=2;
+                else if(s[ordinary_quote++]==delimiter) break;
+            }
+            i=ordinary_quote;
+            // A user-defined suffix belongs to the ordinary literal's
+            // preprocessing token. Its final R must not begin a raw string.
+            uint32_t suffix_char=i<s.size()?s[i]:0;
+            size_t suffix_end=i;
+            bool suffix_ucn=scan_ucn(s,i,suffix_char,suffix_end);
+            if((suffix_ucn&&ident_start(suffix_char))||
+               (!suffix_ucn&&ident_start(suffix_char))) {
+                i=suffix_ucn?suffix_end:i+1;
+                while(i<s.size()) {
+                    uint32_t suffix_body=s[i];
+                    suffix_end=i;
+                    suffix_ucn=scan_ucn(s,i,suffix_body,suffix_end);
+                    if(suffix_ucn&&ident_cont(suffix_body)) i=suffix_end;
+                    else if(!suffix_ucn&&ident_cont(s[i])) ++i;
+                    else break;
+                }
+            }
+            beginning_of_line=false;
+            directive_name_pending=false;
+            continue;
+        }
+        uint32_t decoded=c; size_t after=i;
+        bool ucn=scan_ucn(s,i,decoded,after);
+        if((ucn&&ident_start(decoded))||ident_start(c)) {
+            size_t token_start=i;
+            if(ucn) i=after; else ++i;
+            while(i<s.size()) {
+                decoded=s[i]; after=i; ucn=scan_ucn(s,i,decoded,after);
+                if(ucn&&ident_cont(decoded)) i=after;
+                else if(!ucn&&ident_cont(s[i])) ++i;
+                else break;
+            }
+            if(directive_name_pending) {
+                include_header_pending=(utf8(s,token_start,i)=="include");
+                directive_name_pending=false;
+            }
+            beginning_of_line=false;
+            continue;
+        }
+        if(digit(c)||(c=='.'&&i+1<s.size()&&digit(s[i+1]))) {
+            ++i;
+            while(i<s.size()) {
+                decoded=s[i]; after=i; ucn=scan_ucn(s,i,decoded,after);
+                if((ucn&&ident_cont(decoded))||(!ucn&&(digit(s[i])||ident_cont(s[i])||s[i]=='.'))) {
+                    if(ucn) i=after; else ++i;
+                    continue;
+                }
+                // C++11 pp-number signs follow only e/E, not p/P.
+                if((s[i]=='+'||s[i]=='-')&&i>0&&(s[i-1]=='e'||s[i-1]=='E')) { ++i; continue; }
+                break;
+            }
+            beginning_of_line=false;
+            directive_name_pending=false;
+            continue;
+        }
+        ++i;
+        beginning_of_line=false;
+        directive_name_pending=false;
     }
-    vector<uint32_t> b;
-    for(size_t i=0;i<a.size();i++) { if(a[i]=='\\'&&i+1<a.size()&&a[i+1]=='\n'){i++;continue;} b.push_back(a[i]); }
-    return b;
+    return ranges;
+}
+
+// Translate trigraphs/splices; preserve raw-string bodies, whose phase-1/2
+// transformations are reverted by the C++11 raw-string rule.
+vector<uint32_t> translate(const vector<uint32_t>& source) {
+    // N3485 [lex.phases] 2.2/2, clarified by CWG 1698/2747: perform physical
+    // splicing first, then append LF if a nonempty source has no LF left.
+    // An appended LF does not create a new splice; an EOF backslash remains.
+    Phase12View view=make_phase12_view(source);
+    if(!source.empty()&&(view.chars.empty()||view.chars.back()!='\n'))
+        view.push('\n',source.size());
+    vector<RawLiteralRange> ranges=raw_literal_ranges(view,source);
+    // Once raw ranges own all restoration coordinates, the per-code-point
+    // source map is dead. Release it before allocating the translated result.
+    view.release_offsets();
+    size_t final_size=view.chars.size();
+    for(size_t r=0;r<ranges.size();++r) {
+        const RawLiteralRange& range=ranges[r];
+        const size_t restored=range.source_end-range.source_quote-1;
+        const size_t replaced=range.translated_end-range.prefix_end;
+        if(replaced>final_size||restored>numeric_limits<size_t>::max()-(final_size-replaced))
+            throw length_error("translated source is too large");
+        final_size=final_size-replaced+restored;
+    }
+
+    vector<uint32_t> result;
+    if(final_size>result.max_size()) throw length_error("translated source is too large");
+    result.reserve(final_size);
+    size_t cursor=0;
+    for(size_t r=0;r<ranges.size();++r) {
+        const RawLiteralRange& range=ranges[r];
+        result.insert(result.end(),view.chars.begin()+cursor,
+                      view.chars.begin()+range.prefix_end);
+        result.insert(result.end(),source.begin()+range.source_quote+1,
+                      source.begin()+range.source_end);
+        cursor=range.translated_end;
+    }
+    result.insert(result.end(),view.chars.begin()+cursor,view.chars.end());
+    return result;
 }
 
 struct Scanner {
     IPPTokenStream& out; vector<uint32_t> s; size_t i; bool bol; bool directive; bool directive_name_pending; bool include_next; bool emitted_any; bool line_had;
-    Scanner(IPPTokenStream& o,const vector<uint32_t>& x):out(o),s(x),i(0),bol(true),directive(false),directive_name_pending(false),include_next(false),emitted_any(false),line_had(false){}
+    Scanner(IPPTokenStream& o,vector<uint32_t> x):out(o),s(std::move(x)),i(0),bol(true),directive(false),directive_name_pending(false),include_next(false),emitted_any(false),line_had(false){}
     void token(void(IPPTokenStream::*fn)(const string&),size_t a,size_t b) { (out.*fn)(utf8(s,a,b)); emitted_any=true; line_had=true; }
-    bool starts(size_t p,const string& x) { vector<uint32_t> q=decode_utf8(x); if(p+q.size()>s.size())return false; for(size_t k=0;k<q.size();k++)if(s[p+k]!=q[k])return false;return true; }
+    bool starts(size_t p,const char* x) { size_t k=0; while(x[k]) { if(p+k>=s.size()||s[p+k]!=static_cast<unsigned char>(x[k])) return false; ++k; } return true; }
+    bool starts(size_t p,const string& x) { size_t k=0; while(k<x.size()) { if(p+k>=s.size()||s[p+k]!=static_cast<unsigned char>(x[k])) return false; ++k; } return true; }
     size_t ucn(size_t p, uint32_t& c) {
         if (p + 2 > s.size() || s[p] != '\\' ||
             (s[p + 1] != 'u' && s[p + 1] != 'U')) return p;
@@ -248,8 +494,6 @@ struct Scanner {
         return result;
     }
     void scan() {
-        // A nonempty source lacking LF receives the phase-2 terminating newline.
-        if(!s.empty()&&s.back()!='\n') s.push_back('\n');
         if(s.size()>=3&&s[0]==0xfeff){s[0]=' ';}
         static const char* ops[]={"%:%:","<<=",">>=","->*","...","##","<:",":>","<%","%>","%:","::",".*","->","++","--","<<",">>","<=",">=","==","!=","&&","||","+=","-=","*=","/=","%=","^=","&=","|=","new","delete","and_eq","not_eq","or_eq","xor_eq","bitand","bitor","compl","and","not","or","xor","or_eq",0};
         while(i<s.size()) {
@@ -258,9 +502,28 @@ struct Scanner {
                 bool had=false;
                 for(;;){while(i<s.size()&&s[i]!='\n'&&(s[i]==' '||s[i]=='\t'||s[i]=='\v'||s[i]=='\f'||s[i]=='\r')){i++;had=true;}
                     if(i+1<s.size()&&s[i]=='/'&&s[i+1]=='/') {had=true;i+=2;while(i<s.size()&&s[i]!='\n')i++;break;}
-                    if(i+1<s.size()&&s[i]=='/'&&s[i+1]=='*'){had=true;i+=2;bool closed=false;while(i<s.size()){if(s[i]=='\n'){i++;continue;}if(s[i]=='*'&&i+1<s.size()&&s[i+1]=='/'){i+=2;closed=true;break;}i++;}if(!closed)throw logic_error("unterminated block comment");continue;}break;
+                    if(i+1<s.size()&&s[i]=='/'&&s[i+1]=='*'){
+                        had=true;i+=2;bool closed=false;
+                        while(i<s.size()){
+                            if(s[i]=='\n'){
+                                // Phase 3 replaces the comment with one space
+                                // but retains every newline inside it.
+                                if(had){out.emit_whitespace_sequence();had=false;}
+                                out.emit_new_line();++i;bol=true;directive=false;
+                                directive_name_pending=false;include_next=false;
+                                line_had=false;emitted_any=true;
+                                continue;
+                            }
+                            if(s[i]=='*'&&i+1<s.size()&&s[i+1]=='/'){i+=2;closed=true;break;}
+                            ++i;
+                        }
+                        if(!closed)throw logic_error("unterminated block comment");
+                        continue;
+                    }
+                    break;
                 }
-                if(had)out.emit_whitespace_sequence(); continue;
+                if(had) out.emit_whitespace_sequence();
+                continue;
             }
             size_t a=i;
             // Header-name is enabled only after #include at logical line start.
@@ -298,7 +561,10 @@ struct Scanner {
             if(digit(s[i])||(s[i]=='.'&&i+1<s.size()&&digit(s[i+1]))){size_t j=i+1;while(j<s.size()){if(digit(s[j])||ident_cont(s[j])||s[j]=='.'){j++;continue;}if((s[j]=='+'||s[j]=='-')&&j>i&&(s[j-1]=='e'||s[j-1]=='E')){j++;continue;}break;}i=j;token(&IPPTokenStream::emit_pp_number,a,i);bol=false;continue;}
             bool matched=false;for(int k=0;ops[k];k++){string op=ops[k];if(op=="<:"&&starts(i,"<::")&&(i+3>=s.size()||(s[i+3]!=':'&&s[i+3]!='>')))continue;if(starts(i,op)){i+=op.size();if(op=="<:"&&i<s.size()&&s[i]==':'){}token(&IPPTokenStream::emit_preprocessing_op_or_punc,a,i);if(bol&&(op=="#"||op=="%:")){directive=true;directive_name_pending=true;}bol=false;matched=true;break;}}if(matched)continue;
             if(string("{}[]#();:?~!%^&|=<>+-*/.,").find(char(s[i]))!=string::npos){i++;token(&IPPTokenStream::emit_preprocessing_op_or_punc,a,i);if(bol&&s[a]=='#'){directive=true;directive_name_pending=true;}bol=false;continue;}
-            if(s[i]=='\''||s[i]=='"')throw logic_error("unterminated literal");i++;token(&IPPTokenStream::emit_non_whitespace_char,a,i);bol=false;
+            if(s[i]=='\''||s[i]=='"') throw logic_error("unterminated literal");
+            ++i;
+            token(&IPPTokenStream::emit_non_whitespace_char,a,i);
+            bol=false;
         }
         out.emit_eof();
     }
@@ -325,7 +591,7 @@ int RunBatchMode()
         if(fields.size()!=3){cout<<"EXIT_FAILURE\n";continue;}
         ifstream in(fields[2].c_str(),ios::binary); if(!in){ofstream e(fields[1].c_str());e<<"ERROR: cannot read input\n";cout<<"EXIT_FAILURE\n";continue;}
         ostringstream data;data<<in.rdbuf(); ofstream outFile(fields[0].c_str(),ios::binary); streambuf* oldOut=cout.rdbuf(outFile.rdbuf());streambuf* oldErr=cerr.rdbuf(outFile.rdbuf()); int status=0;
-        try{DebugPPTokenStream sink;vector<uint32_t> cps=decode_utf8(data.str());vector<uint32_t> translated=translate(cps);Scanner sc(sink,translated);sc.scan();}catch(exception& e){cerr<<"ERROR: "<<e.what()<<endl;status=1;}
+        try{DebugPPTokenStream sink;vector<uint32_t> cps=decode_utf8(data.str());vector<uint32_t> translated=translate(cps);Scanner sc(sink,std::move(translated));sc.scan();}catch(exception& e){cerr<<"ERROR: "<<e.what()<<endl;status=1;}
         cout.rdbuf(oldOut);cerr.rdbuf(oldErr);cout<<(status?"EXIT_FAILURE":"EXIT_SUCCESS")<<endl;
     }return 0;
 }
@@ -345,7 +611,7 @@ int main(int argc, char** argv)
 		DebugPPTokenStream output;
         vector<uint32_t> cps=decode_utf8(input);
         vector<uint32_t> translated=translate(cps);
-        Scanner scanner(output,translated);
+        Scanner scanner(output,std::move(translated));
         scanner.scan();
 
 		return EXIT_SUCCESS;
