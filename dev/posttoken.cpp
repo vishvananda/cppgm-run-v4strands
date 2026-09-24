@@ -707,33 +707,54 @@ long double PA2Decode_long_double(const string &s) {
 }
 
 namespace {
-struct PostToken {
-  string kind, source;
+struct LiteralUnit {
+  uint32_t value;
+  bool numeric_escape;
 };
-struct PostTokenCollector : IPPTokenStream {
-  vector<PostToken> tokens;
+struct PostTokenProcessor : IPPTokenStream {
+  explicit PostTokenProcessor(DebugPostTokenOutputStream &output)
+      : output(output), string_run_open(false), string_run_invalid(false) {}
+
   void emit_whitespace_sequence() {}
   void emit_new_line() {}
-  void emit_header_name(const string &s) { tokens.push_back({"invalid", s}); }
-  void emit_identifier(const string &s) { tokens.push_back({"identifier", s}); }
-  void emit_pp_number(const string &s) { tokens.push_back({"number", s}); }
+  void emit_header_name(const string &s) {
+    process_nonstring("invalid", s);
+  }
+  void emit_identifier(const string &s) {
+    process_nonstring("identifier", s);
+  }
+  void emit_pp_number(const string &s) {
+    process_nonstring("number", s);
+  }
   void emit_character_literal(const string &s) {
-    tokens.push_back({"character", s});
+    process_nonstring("character", s);
   }
   void emit_user_defined_character_literal(const string &s) {
-    tokens.push_back({"ud-character", s});
+    process_nonstring("ud-character", s);
   }
-  void emit_string_literal(const string &s) { tokens.push_back({"string", s}); }
-  void emit_user_defined_string_literal(const string &s) {
-    tokens.push_back({"ud-string", s});
-  }
+  void emit_string_literal(const string &s) { process_string(s); }
+  void emit_user_defined_string_literal(const string &s) { process_string(s); }
   void emit_preprocessing_op_or_punc(const string &s) {
-    tokens.push_back({"operator", s});
+    process_nonstring("operator", s);
   }
   void emit_non_whitespace_char(const string &s) {
-    tokens.push_back({"invalid", s});
+    process_nonstring("invalid", s);
   }
-  void emit_eof() {}
+  void emit_eof() {
+    flush_strings();
+    output.emit_eof();
+  }
+
+private:
+  DebugPostTokenOutputStream &output;
+  bool string_run_open;
+  bool string_run_invalid;
+  string string_source, string_suffix, string_encoding;
+  vector<LiteralUnit> string_values;
+
+  void process_string(const string &source);
+  void flush_strings();
+  void process_nonstring(const string &kind, const string &source);
 };
 int digit_value(char c) {
   if (c >= '0' && c <= '9')
@@ -1140,10 +1161,6 @@ uint32_t decode_escape(const vector<uint32_t> &v, size_t &p,
   return c;
 }
 
-struct LiteralUnit {
-  uint32_t value;
-  bool numeric_escape;
-};
 struct ParsedLiteral {
   bool ok = false;
   string prefix, suffix;
@@ -1330,127 +1347,122 @@ void emit_character(DebugPostTokenOutputStream &o, const string &s, bool ud) {
       o.emit_literal(s, t, &x, sizeof x);
   }
 }
-struct StringPart {
-  string source, kind;
-  ParsedLiteral parsed;
-};
-void process_strings(DebugPostTokenOutputStream &o,
-                     const vector<StringPart> &parts) {
-  if (parts.empty())
-    return;
-  string src, suffix, enc;
-  bool bad = false;
-  for (size_t i = 0; i < parts.size(); i++) {
-    if (i)
-      src += ' ';
-    src += parts[i].source;
-    const StringPart &p = parts[i];
-    if (!p.parsed.ok) {
-      bad = true;
-      continue;
-    }
-    string e = p.parsed.prefix;
-    if (e.size() && e.back() == 'R')
-      e.erase(e.size() - 1);
-    if (e == "R")
-      e = "";
-    if (!e.empty()) {
-      if (!enc.empty() && enc != e)
-        bad = true;
-      enc = e;
-    }
-    if (!p.parsed.suffix.empty()) {
-      if (!suffix.empty() && suffix != p.parsed.suffix)
-        bad = true;
-      suffix = p.parsed.suffix;
-    }
+void PostTokenProcessor::process_string(const string &source) {
+  if (!string_run_open) {
+    string_run_open = true;
+    string_run_invalid = false;
+    string_source.clear();
+    string_suffix.clear();
+    string_encoding.clear();
+    string_values.clear();
+  } else {
+    string_source += ' ';
   }
-  // Numeric escape sequences denote code-unit values, not Unicode scalar
-  // values to be re-encoded. Reject values that cannot be represented by the
-  // selected literal element type before emit_units narrows them.
-  const uint64_t max_unit =
-      (enc == "u" ? 0xffffULL
-                  : (enc == "U" || enc == "L" ? UINT32_MAX : 0xffULL));
-  for (const StringPart &p : parts) {
-    for (const LiteralUnit &unit : p.parsed.values) {
-      if (unit.numeric_escape && unit.value > max_unit)
-        bad = true;
-    }
-  }
-  if (bad) {
-    o.emit_invalid(src);
+  string_source += source;
+
+  ParsedLiteral parsed = parse_quoted(source, false);
+  if (!parsed.ok) {
+    string_run_invalid = true;
     return;
   }
-  vector<uint32_t> units;
-  for (const auto &p : parts)
-    append_units(units, p.parsed.values, enc);
-  emit_units(o, src, suffix, enc, units, !suffix.empty());
+  string encoding = parsed.prefix;
+  if (!encoding.empty() && encoding.back() == 'R')
+    encoding.erase(encoding.size() - 1);
+  if (encoding == "R")
+    encoding.clear();
+  if (!encoding.empty()) {
+    if (!string_encoding.empty() && string_encoding != encoding)
+      string_run_invalid = true;
+    string_encoding = encoding;
+  }
+  if (!parsed.suffix.empty()) {
+    if (!string_suffix.empty() && string_suffix != parsed.suffix)
+      string_run_invalid = true;
+    string_suffix = parsed.suffix;
+  }
+  string_values.insert(string_values.end(), parsed.values.begin(),
+                       parsed.values.end());
 }
-void process_tokens(DebugPostTokenOutputStream &o,
-                    const vector<PostToken> &tokens) {
-  vector<StringPart> strings;
-  auto flush = [&]() {
-    process_strings(o, strings);
-    strings.clear();
-  };
-  for (const PostToken &t : tokens) {
-    if (t.kind == "string" || t.kind == "ud-string") {
-      StringPart p;
-      p.source = t.source;
-      p.kind = t.kind;
-      p.parsed = parse_quoted(t.source, false);
-      strings.push_back(p);
-      continue;
-    }
-    flush();
-    if (t.kind == "identifier") {
-      auto it = StringToTokenTypeMap.find(t.source);
-      if (it == StringToTokenTypeMap.end())
-        o.emit_identifier(t.source);
-      else
-        o.emit_simple(t.source, it->second);
-    } else if (t.kind == "operator") {
-      auto it = StringToTokenTypeMap.find(t.source);
-      if (t.source == "#" || t.source == "##" || t.source == "%:" ||
-          t.source == "%:%:" || it == StringToTokenTypeMap.end())
-        o.emit_invalid(t.source);
-      else
-        o.emit_simple(t.source, it->second);
-    } else if (t.kind == "number") {
-      NumberInfo n = parse_number(t.source);
-      if (!n.valid)
-        o.emit_invalid(t.source);
-      else if (n.ud) {
-        if (n.floating)
-          o.emit_user_defined_literal_floating(t.source, n.suffix, n.prefix);
-        else
-          o.emit_user_defined_literal_integer(t.source, n.suffix, n.prefix);
-      } else if (n.floating) {
-        size_t e = t.source.size() - 1;
-        char last = t.source[e];
-        string f =
-            (last == 'f' || last == 'F') ? t.source.substr(0, e) : t.source;
-        string d =
-            (last == 'l' || last == 'L') ? t.source.substr(0, e) : t.source;
-        if (last == 'f' || last == 'F') {
-          float v = PA2Decode_float(f);
-          emit_scalar(o, t.source, FT_FLOAT, v);
-        } else if (last == 'l' || last == 'L') {
-          long double v = PA2Decode_long_double(d);
-          emit_scalar(o, t.source, FT_LONG_DOUBLE, v);
-        } else {
-          double v = PA2Decode_double(t.source);
-          emit_scalar(o, t.source, FT_DOUBLE, v);
-        }
-      } else
-        emit_integer(o, t.source, n);
-    } else if (t.kind == "character" || t.kind == "ud-character")
-      emit_character(o, t.source, t.kind == "ud-character");
-    else
-      o.emit_invalid(t.source);
+
+void PostTokenProcessor::flush_strings() {
+  if (!string_run_open)
+    return;
+  const uint64_t max_unit =
+      (string_encoding == "u" ? 0xffffULL
+                               : (string_encoding == "U" ||
+                                          string_encoding == "L"
+                                      ? UINT32_MAX
+                                      : 0xffULL));
+  for (const LiteralUnit &unit : string_values) {
+    if (unit.numeric_escape && unit.value > max_unit)
+      string_run_invalid = true;
   }
-  flush();
-  o.emit_eof();
+  if (string_run_invalid) {
+    output.emit_invalid(string_source);
+  } else {
+    vector<uint32_t> units;
+    append_units(units, string_values, string_encoding);
+    emit_units(output, string_source, string_suffix, string_encoding, units,
+               !string_suffix.empty());
+  }
+  string_run_open = false;
+  string_run_invalid = false;
+  string_source.clear();
+  string_suffix.clear();
+  string_encoding.clear();
+  string_values.clear();
+}
+
+void PostTokenProcessor::process_nonstring(const string &kind,
+                                           const string &source) {
+  flush_strings();
+  if (kind == "invalid") {
+    output.emit_invalid(source);
+  } else if (kind == "identifier") {
+    auto it = StringToTokenTypeMap.find(source);
+    if (it == StringToTokenTypeMap.end())
+      output.emit_identifier(source);
+    else
+      output.emit_simple(source, it->second);
+  } else if (kind == "operator") {
+    auto it = StringToTokenTypeMap.find(source);
+    if (source == "#" || source == "##" || source == "%:" ||
+        source == "%:%:" || it == StringToTokenTypeMap.end())
+      output.emit_invalid(source);
+    else
+      output.emit_simple(source, it->second);
+  } else if (kind == "number") {
+    NumberInfo n = parse_number(source);
+    if (!n.valid)
+      output.emit_invalid(source);
+    else if (n.ud) {
+      if (n.floating)
+        output.emit_user_defined_literal_floating(source, n.suffix, n.prefix);
+      else
+        output.emit_user_defined_literal_integer(source, n.suffix, n.prefix);
+    } else if (n.floating) {
+      size_t e = source.size() - 1;
+      char last = source[e];
+      string f = (last == 'f' || last == 'F') ? source.substr(0, e) : source;
+      string d = (last == 'l' || last == 'L') ? source.substr(0, e) : source;
+      if (last == 'f' || last == 'F') {
+        float v = PA2Decode_float(f);
+        emit_scalar(output, source, FT_FLOAT, v);
+      } else if (last == 'l' || last == 'L') {
+        long double v = PA2Decode_long_double(d);
+        emit_scalar(output, source, FT_LONG_DOUBLE, v);
+      } else {
+        double v = PA2Decode_double(source);
+        emit_scalar(output, source, FT_DOUBLE, v);
+      }
+    } else {
+      emit_integer(output, source, n);
+    }
+  } else if (kind == "character" || kind == "ud-character") {
+    emit_character(output, source, kind == "ud-character");
+  } else {
+    output.emit_invalid(source);
+  }
 }
 } // namespace
 
@@ -1497,10 +1509,9 @@ int RunBatchMode() {
     streambuf *oldOut = cout.rdbuf(outFile.rdbuf());
     int status = 0;
     try {
-      PostTokenCollector stream;
-      ScanPreprocessingTokens(data.str(), stream);
       DebugPostTokenOutputStream output;
-      process_tokens(output, stream.tokens);
+      PostTokenProcessor stream(output);
+      ScanPreprocessingTokens(data.str(), stream);
     } catch (exception &e) {
       cerr << "ERROR: " << e.what() << endl;
       status = 1;
@@ -1517,10 +1528,9 @@ int main(int argc, char **argv) {
       return RunBatchMode();
     ostringstream data;
     data << cin.rdbuf();
-    PostTokenCollector stream;
-    ScanPreprocessingTokens(data.str(), stream);
     DebugPostTokenOutputStream output;
-    process_tokens(output, stream.tokens);
+    PostTokenProcessor stream(output);
+    ScanPreprocessingTokens(data.str(), stream);
     return EXIT_SUCCESS;
   } catch (exception &e) {
     cerr << "ERROR: " << e.what() << endl;
